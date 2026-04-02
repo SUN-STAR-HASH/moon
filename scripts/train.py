@@ -377,18 +377,25 @@ def main(config: _config.TrainConfig):
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     # Log images from first batch to sanity check.
-    images_to_log = [
-        wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
-        for i in range(min(5, len(next(iter(batch[0].images.values())))))
-    ]
-    wandb.log({"camera_views": images_to_log}, step=0)
-
+    if config.wandb_enabled:
+        images_to_log = [
+            wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
+            for i in range(min(5, len(next(iter(batch[0].images.values())))))
+        ]
+        wandb.log({"camera_views": images_to_log}, step=0)
+        
     # Get norm_stats for correlation matrix loading
     data_config = data_loader.data_config()
     if data_config.norm_stats is None:
-        raise ValueError(
-            "norm_stats not found. Run compute_norm_stats.py to generate normalization statistics."
-        )
+        if data_config.repo_id == "fake":
+            logging.warning(
+                "norm_stats not found for fake laptop smoke config; "
+                "skipping normalization stats requirement."
+            )
+        else:
+            raise ValueError(
+                "norm_stats not found. Run compute_norm_stats.py to generate normalization statistics."
+            )
     norm_stats = data_config.norm_stats
 
     train_state, train_state_sharding = init_train_state(
@@ -429,14 +436,22 @@ def main(config: _config.TrainConfig):
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
-            
+
             # Create a concise console log with main metrics
-            main_metrics = {k: v for k, v in reduced_info.items() 
-                          if "loss" in k or "accuracy" in k or k in ["grad_norm", "param_norm", "grad_norm_vlm", "grad_norm_action_expert"]}
+            main_metrics = {
+                k: v for k, v in reduced_info.items()
+                if "loss" in k or "accuracy" in k or k in [
+                    "grad_norm", "param_norm", "grad_norm_vlm", "grad_norm_action_expert"
+                ]
+            }
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in main_metrics.items())
             pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
+
+            if config.wandb_enabled:
+                wandb.log(reduced_info, step=step)
+
             infos = []
+        
         batch = next(data_iter)
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
