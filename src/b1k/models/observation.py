@@ -140,4 +140,3 @@ def preprocess_observation(
         fast_tokens=getattr(observation, 'fast_tokens', None),
         fast_token_mask=getattr(observation, 'fast_token_mask', None),
     )
-
