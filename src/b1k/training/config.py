@@ -1,6 +1,12 @@
-"""Training configuration for BEHAVIOR-1K challenge.
+"""BEHAVIOR-1K 학습 설정 파일.
 
-Reference: https://github.com/Physical-Intelligence/openpi
+이 파일은 데이터셋을 어떻게 읽을지, 어떤 변환을 거칠지,
+그리고 모델 입력 형식을 어떻게 맞출지를 정한다.
+이번 수정의 핵심은 아래와 같다.
+
+1. 모델 구조와 웨이트 모양은 그대로 둔다.
+2. 실제 학습/평가에서는 12개 태스크만 사용한다.
+3. 데이터셋의 작은 번호를 원래 50개 기준 task id로 바꿔 모델에 넣는다.
 """
 
 import abc
@@ -35,6 +41,7 @@ from b1k.policies import b1k_policy
 from b1k.shared import normalize as _normalize
 from b1k.training import weight_loaders
 from b1k import transforms as b1k_transforms
+from b1k.configs.task_subset import LOCAL_TO_GLOBAL, SELECTED_TASKS
 
 ModelType: TypeAlias = _model.ModelType
 Filter: TypeAlias = nnx.filterlib.Filter
@@ -52,44 +59,51 @@ class AssetsConfig:
 
 @dataclasses.dataclass(frozen=True)
 class DataConfig:
-    # LeRobot repo id. If None, fake data will be created.
+    # 사용할 LeRobot 데이터셋 이름.
+    # None이면 진짜 데이터를 읽지 않고 테스트용 가짜 데이터를 만든다.
     repo_id: str | None = None
-    # Directory within the assets directory containing the data assets.
+    # 정규화 통계나 토크나이저 같은 부가 파일이 들어 있는 하위 폴더 이름.
     asset_id: str | None = None
-    # Contains precomputed normalization stats. If None, normalization will not be performed.
+    # 미리 계산해 둔 정규화 통계. None이면 정규화를 하지 않는다.
     norm_stats: dict[str, _transforms.NormStats] | None = None
 
-    # Used to adopt the inputs from a dataset specific format to a common format
+    # 데이터셋마다 다른 입력 형식을 공통 형식으로 맞추는 변환
     repack_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
-    # Data transforms, typically include robot specific transformations.
+    # 로봇 특성에 맞는 추가 데이터 변환
     data_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
-    # Model specific transforms. Will be applied after the data is normalized.
+    # 모델 전용 변환. 정규화 후에 적용된다.
     model_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
     
-    # If true, will use quantile normalization. Otherwise, normal z-score normalization will be used.
+    # True면 분위수 정규화를 쓰고, False면 일반적인 z-score 정규화를 쓴다.
     use_quantile_norm: bool = False
-    # If true, will use per-timestamp normalization for actions
+    # True면 행동 시퀀스를 시간축별로 따로 정규화한다.
     use_per_timestamp_norm: bool = False
 
-    # Names of keys that will be used by the data loader to generate the action sequence.
+    # 행동 시퀀스를 만들 때 어떤 키를 읽을지 지정
     action_sequence_keys: Sequence[str] = ("actions",)
 
-    # If true, will use the LeRobot dataset task to define the prompt (not used for PI_BEHAVIOR).
+    # True면 데이터셋의 task 문자열을 프롬프트로 쓴다. PI_BEHAVIOR에서는 사용하지 않는다.
     prompt_from_task: bool = False
 
-    # Only used for RLDS data loader.
+    # RLDS 로더에서만 사용
     rlds_data_dir: str | None = None
 
-    # Only used for B1K data loader.
+    # B1K 로더에서만 사용
     behavior_dataset_root: str | None = None
 
-    # Action space for DROID dataset.
+    # DROID 데이터셋용 action space
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
-    # Path to the data filter file for DROID dataset
+    # DROID 데이터 필터 파일 경로
     filter_dict_path: str | None = None
 
-    # Episodes index to use for training 
+    # 학습에 사용할 episode 번호 목록
     episodes_index: List[int] | None = None
+
+    # True면 전체 50개 태스크 대신 선택한 12개 태스크만 사용한다.
+    use_task_subset: bool = False
+
+    # subset 모드일 때 허용할 원래 task id 목록
+    allowed_task_ids: List[int] | None = None
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -97,16 +111,17 @@ class GroupFactory(Protocol):
 
 @dataclasses.dataclass(frozen=True)
 class ModelTransformFactory(GroupFactory):
-    """Creates model transforms for B1K."""
+    """B1K용 모델 입력 변환 묶음을 만든다."""
 
-    default_prompt: str | None = None  # Not used (task embeddings instead)
+    # 이 모델은 텍스트 프롬프트 대신 task embedding을 쓰므로 사실상 사용하지 않는다.
+    default_prompt: str | None = None
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         return _transforms.Group(
             inputs=[
                 _transforms.ResizeImages(224, 224),
                 b1k_transforms.ComputeSubtaskStateFromMeta(dataset=None),
-                b1k_transforms.TaskIndexToTaskId(),
+                b1k_transforms.TaskIndexToTaskId(task_mapping=LOCAL_TO_GLOBAL),
                 _transforms.PadStatesAndActions(model_config.action_dim),
             ],
         )
@@ -193,7 +208,10 @@ class LeRobotB1KDataConfig(DataConfigFactory):
             outputs=[_transforms.AbsoluteActions(delta_action_mask)],
         )
 
-        # Model transforms (subtask state, task ID, padding)
+        # 모델 입력용 변환.
+        # 여기서 가장 중요한 부분은 task 번호를 바꾸는 것이다.
+        # 데이터셋에서 0~11처럼 들어와도, 모델에는 50개 기준 원래 task id를 넣어야
+        # 기존 웨이트를 그대로 사용할 수 있다.
         model_transforms = ModelTransformFactory()(model_config)
         
         # FAST tokenization (if enabled for PI_BEHAVIOR)
@@ -227,6 +245,11 @@ class LeRobotB1KDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=self.action_sequence_keys,
+            # 아래 두 값은 "모델 구조를 12개로 줄인다"는 뜻이 아니다.
+            # 모델은 그대로 50개 구조를 유지하고,
+            # 실제로 읽고 학습할 데이터만 12개 태스크로 제한하겠다는 뜻이다.
+            use_task_subset=True,
+            allowed_task_ids=list(SELECTED_TASKS),
         )
 
 @dataclasses.dataclass(frozen=True)
@@ -297,6 +320,12 @@ class TrainConfig:
     val_num_batches: int = 10
     val_repo_id: str | None = None
     val_episodes_index: List[int] | None = None
+
+    # True면 전체 50개 태스크 대신 선택한 12개 태스크만 사용한다.
+    use_task_subset: bool = False
+
+    # subset 모드일 때 허용할 원래 task id 목록
+    allowed_task_ids: List[int] | None = None
     
     # Number of flow matching samples per training step
     num_flow_samples: int = 1

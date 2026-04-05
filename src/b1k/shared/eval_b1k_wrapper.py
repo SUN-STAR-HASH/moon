@@ -1,4 +1,8 @@
-"""B1K policy wrapper with action compression, rolling inpainting, and stage voting."""
+"""평가/서빙 시 정책 출력에 후처리를 적용하는 wrapper.
+
+이번 설정에서는 5070에서 시뮬레이터를 돌리므로 한 번에 너무 많은 행동을 실행하지 않게 기본값을 줄였다.
+또, stage 추적과 rolling inpainting 구조는 그대로 유지한다.
+"""
 
 import logging
 import numpy as np
@@ -21,13 +25,13 @@ RESIZE_SIZE = 224
 @dataclasses.dataclass
 class B1KWrapperConfig:
     """Configuration for B1K policy wrapper execution parameters."""
-    actions_to_execute: int = 26
+    actions_to_execute: int = 16
     actions_to_keep: int = 4
-    execute_in_n_steps: int = 20
+    execute_in_n_steps: int = 12
     history_len: int = 3
     votes_to_promote: int = 2
     time_threshold_inpaint: float = 0.3
-    num_steps: int = 20
+    num_steps: int = 8
     apply_eval_tricks: bool = True
 
 

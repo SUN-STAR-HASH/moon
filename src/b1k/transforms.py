@@ -1,16 +1,17 @@
-"""Data transforms for BEHAVIOR-1K dataset.
+"""BEHAVIOR-1K 전용 데이터 변환 모음.
 
-Standard transforms imported from OpenPI.
-B1K-specific: TaskIndexToTaskId, ComputeSubtaskStateFromMeta, TokenizeFASTActions
-
-Reference: https://github.com/wensi-ai/openpi/tree/behavior
+OpenPI 기본 변환에 더해,
+- task 번호를 모델 입력 형식으로 바꾸는 변환
+- timestamp로 stage를 계산하는 변환
+- FAST 보조 토큰을 만드는 변환
+을 추가했다.
 """
 
 import dataclasses
 import logging
 import numpy as np
 
-# Import all standard transforms from OpenPI
+# OpenPI에서 기본 변환 도구들을 가져온다.
 from openpi.transforms import (
     DataTransformFn,
     DataDict,
@@ -25,7 +26,7 @@ from openpi.transforms import (
     DeltaActions,
     AbsoluteActions,
     PadStatesAndActions,
-    PromptFromLeRobotTask,  # Not used for PI_BEHAVIOR but kept for compatibility
+    PromptFromLeRobotTask,  # PI_BEHAVIOR에서는 거의 쓰지 않지만 호환성을 위해 남겨둔다.
     flatten_dict,
     unflatten_dict,
     transform_dict,
@@ -100,7 +101,7 @@ class TaskIndexToTaskId(DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class ComputeSubtaskStateFromMeta(DataTransformFn):
-    """Computes subtask state from timestamp using dataset.meta.episodes.
+    """timestamp와 episode 길이를 이용해 현재 stage 번호를 계산한다.
     
     Divides episode into task-specific number of stages based on episode length.
     Requires dataset reference to access episode metadata.

@@ -1,8 +1,7 @@
-"""Observation class and preprocessing with FAST auxiliary fields support.
+"""Observation 자료형과 전처리 함수.
 
-Based on openpi with FAST fields added for PI_BEHAVIOR model.
-
-Reference: https://github.com/wensi-ai/openpi/blob/behavior/src/openpi/models/model.py
+기존 openpi Observation에 FAST 관련 필드를 추가한 버전이다.
+이미지는 [-1, 1] 범위로 맞추고, 필요하면 학습 시 증강도 수행한다.
 """
 
 from collections.abc import Sequence
@@ -32,7 +31,10 @@ IMAGE_RESOLUTION = (224, 224)
 @at.typecheck
 @struct.dataclass
 class Observation(Generic[ArrayT]):
-    """Observation with FAST auxiliary fields."""
+    """모델이 읽는 observation 묶음.
+
+    이미지, 상태(state), task/stage 프롬프트 토큰, 그리고 필요하면 FAST 토큰까지 함께 담는다.
+    """
     
     images: dict[str, at.Float[ArrayT, "*b h w c"]]
     image_masks: dict[str, at.Bool[ArrayT, "*b"]]
@@ -51,7 +53,7 @@ class Observation(Generic[ArrayT]):
         if ("tokenized_prompt" in data) != ("tokenized_prompt_mask" in data):
             raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
         
-        # Convert uint8 images to float32 [-1, 1]
+        # uint8 이미지를 모델이 바로 쓰기 쉬운 float32 [-1, 1] 범위로 바꾼다.
         for key in data["image"]:
             if data["image"][key].dtype == np.uint8:
                 data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
@@ -86,8 +88,7 @@ def preprocess_observation(
     image_keys: Sequence[str] = IMAGE_KEYS,
     image_resolution: tuple[int, int] = IMAGE_RESOLUTION,
 ) -> Observation:
-    """Preprocess observations with image augmentation and FAST fields preservation."""
-    if not set(image_keys).issubset(observation.images):
+    """이미지 크기를 맞추고, 학습 시에는 증강을 적용하며, FAST 관련 필드는 그대로 보존한다."""    if not set(image_keys).issubset(observation.images):
         raise ValueError(f"images dict missing keys: expected {image_keys}, got {list(observation.images)}")
 
     batch_shape = observation.state.shape[:-1]
@@ -99,7 +100,7 @@ def preprocess_observation(
             image = image_tools.resize_with_pad(image, *image_resolution)
 
         if train:
-            # Convert from [-1, 1] to [0, 1] for augmax
+            # augmax 증강 함수는 [0, 1] 범위를 기대하므로 잠시 바꿔 준다.
             image = image / 2.0 + 0.5
 
             transforms = []
@@ -116,12 +117,12 @@ def preprocess_observation(
             sub_rngs = jax.random.split(rng, image.shape[0])
             image = jax.vmap(augmax.Chain(*transforms))(sub_rngs, image)
 
-            # Back to [-1, 1]
+            # 증강이 끝나면 다시 [-1, 1] 범위로 돌린다.
             image = image * 2.0 - 1.0
 
         out_images[key] = image
 
-    # Obtain masks
+    # 이미지가 실제로 존재하는지 나타내는 mask를 만든다.
     out_masks = {}
     for key in out_images:
         if key not in observation.image_masks:

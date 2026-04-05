@@ -1,11 +1,9 @@
-"""Data loader utilities for BEHAVIOR-1K training.
-This file mirrors openpi.training.data_loader, but swaps the dataset creation
-path to use OmniGibson's BehaviorLeRobotDataset when available.
+"""BEHAVIOR-1K 학습용 데이터 로더.
 
-The goal is:
-1. Load BEHAVIOR-1K from a local root if provided.
-2. Reuse OpenPI's transform / batching / sharding pipeline.
-3. Avoid requiring videos for smoke tests (download_videos=False).
+핵심 역할은 아래와 같다.
+- OmniGibson/LeRobot 형식의 데이터를 읽는다.
+- OpenPI의 배치/변환 파이프라인을 그대로 재사용한다.
+- 이번 수정에서는 50개 태스크 전체가 아니라 12개 태스크만 걸러서 쓸 수 있게 한다.
 """
 
 import importlib
@@ -26,16 +24,41 @@ import openpi.models.model as _model
 import openpi.training.data_loader as _openpi_data_loader
 from b1k.training import config as _config
 from b1k.models.observation import Observation
+from b1k.configs.task_subset import SELECTED_TASKS
 
 logger = logging.getLogger(__name__)
 
 
-class DataLoaderImpl(_openpi_data_loader.DataLoader):
-    """Custom DataLoader using our Observation with fast_tokens.
+def _filter_to_selected_tasks(dataset, allowed_task_ids):
+    """선택한 태스크만 남기는 간단한 필터.
 
-    OpenPI 기본 DataLoaderImpl은 openpi.models.model.Observation을 반환할 수 있는데,
-    현재 train_step은 b1k.models.observation.Observation을 기대하므로
-    여기서 Observation.from_dict(batch)로 변환해서 넘긴다.
+    데이터셋 구현마다 내부 구조가 조금 달라서,
+    대표적으로 많이 쓰는 `hf_dataset` 또는 `dataset` 필드를 우선 시도한다.
+    필터를 적용할 수 없는 구조면 경고만 남기고 원본을 그대로 반환한다.
+    """
+    allowed = set(int(x) for x in allowed_task_ids)
+    base = getattr(dataset, "hf_dataset", None) or getattr(dataset, "dataset", None)
+    if base is None or not hasattr(base, "filter"):
+        logger.warning("subset 필터를 적용할 수 있는 내부 dataset 객체를 찾지 못했다. 원본 데이터셋을 그대로 사용한다.")
+        return dataset
+    try:
+        filtered = base.filter(lambda ex: int(ex.get("task_index", ex.get("task_id", -1))) in allowed)
+        if getattr(dataset, "hf_dataset", None) is not None:
+            dataset.hf_dataset = filtered
+        elif getattr(dataset, "dataset", None) is not None:
+            dataset.dataset = filtered
+        logger.info("12개 task subset 필터 적용 완료: %s", sorted(allowed))
+    except Exception as exc:
+        logger.warning("subset 필터 적용 중 문제가 생겨 원본 데이터셋을 그대로 사용한다: %s", exc)
+    return dataset
+
+
+class DataLoaderImpl(_openpi_data_loader.DataLoader):
+    """우리 프로젝트용 Observation 형식으로 배치를 바꿔서 내보내는 DataLoader.
+
+    OpenPI 기본 로더는 openpi 쪽 Observation 타입을 만들 수 있는데,
+    현재 학습 코드는 b1k.models.observation.Observation을 기대하므로
+    여기에서 한 번 감싸서 넘겨준다.
     """
     def __init__(
         self,
@@ -305,7 +328,10 @@ def create_behavior_dataset(
                     "index": np.int64(idx),
                 }
 
-        return _LaptopFakeBehaviorDataset()
+        dataset = _LaptopFakeBehaviorDataset()
+        if getattr(data_config, 'use_task_subset', False):
+            dataset = _filter_to_selected_tasks(dataset, data_config.allowed_task_ids or SELECTED_TASKS)
+        return dataset
 
     # ------------------------------------------------------------------
     # Real dataset path

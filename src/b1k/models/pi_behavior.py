@@ -1,6 +1,11 @@
-"""The main model for BEHAVIOR-1K challenge.
+"""BEHAVIOR-1K용 주 모델 정의 파일.
 
-Based on Pi0.5 implementation from PhysicalIntelligence/openpi
+이 모델은 Pi0.5를 바탕으로 만들어졌고,
+이번 실험에서는 아래 원칙을 유지한다.
+- task embedding 유지
+- flow matching 유지
+- stage 관련 구조는 남겨 두되, 필요하면 학습/추론에서 영향만 줄인다.
+- 모델 파라미터 모양은 그대로 두어 기존 웨이트를 계속 사용할 수 있게 한다.
 """
 
 import logging
@@ -19,7 +24,7 @@ from openpi.models import siglip as _siglip
 from openpi.models.pi0 import make_attn_mask, posemb_sincos
 from openpi.shared import array_typing as at
 
-# Import from our custom modules
+# 우리 프로젝트에서 추가한 설정/입력 모듈
 from b1k.models import pi_behavior_config
 from b1k.models.observation import Observation, preprocess_observation
 from b1k.models.pi_behavior_config import (
@@ -33,32 +38,32 @@ logger = logging.getLogger("b1k")
 
 
 class KVCacheTransform(nnx.Module):
-    """Transforms prefix KV cache by mixing across layers.
+    """여러 층의 KV cache를 섞어 새로운 KV cache를 만드는 모듈.
     
-    Each destination layer's K and V become learnable linear combinations
+    각 목적 층의 K와 V를 여러 원본 층의 선형 결합으로 만든다.
     of all source layers' K and V, plus a bias term. This allows the action
     expert to attend to learned combinations of VLM layers rather than being
     forced to attend layer-by-layer.
     
-    Initialized as identity transform (k_coeffs = I, bias = 0) so the model
+    처음에는 사실상 아무 변화도 일어나지 않도록 identity로 시작한다. (k_coeffs = I, bias = 0) so the model
     starts with the same behavior as without transformation.
     """
     
     def __init__(self, num_layers: int, head_dim: int, num_kv_heads: int, rngs: nnx.Rngs):
-        # K transformation: [dest_layer, src_layer]
-        # Initialize as identity so transformation is initially a no-op
+        # K 변환 가중치: [도착층, 원본층]
+        # 처음에는 입력을 그대로 통과시키도록 identity로 초기화
         self.k_coeffs = nnx.Param(jnp.eye(num_layers, dtype=jnp.float32))
         
-        # K bias: [layer, num_kv_heads, head_dim]
-        # Initialize as zeros
+        # K bias: [층, KV head 수, head 차원]
+        # bias는 0으로 시작
         self.k_bias = nnx.Param(jnp.zeros((num_layers, num_kv_heads, head_dim), dtype=jnp.float32))
         
-        # V transformation (independent from K)
+        # V 변환은 K와 별도로 독립적으로 학습
         self.v_coeffs = nnx.Param(jnp.eye(num_layers, dtype=jnp.float32))
         self.v_bias = nnx.Param(jnp.zeros((num_layers, num_kv_heads, head_dim), dtype=jnp.float32))
     
     def __call__(self, kv_cache: tuple[jnp.ndarray, jnp.ndarray]) -> tuple[jnp.ndarray, jnp.ndarray]:
-        """Transform KV cache by mixing across layers.
+        """여러 층의 KV cache를 섞어 새 KV cache를 만든다.
         
         Args:
             kv_cache: Tuple of (cache_k, cache_v) where each has shape
@@ -68,22 +73,22 @@ class KVCacheTransform(nnx.Module):
             Transformed (k_new, v_new) with same shape and dtype as input
         """
         cache_k, cache_v = kv_cache
-        # Shape: [layers, batch, seq_len, num_kv_heads, head_dim]
+        # 모양: [층, 배치, 시퀀스 길이, KV head 수, head 차원]
         
-        # Preserve original dtype (important for bfloat16 training)
+        # bfloat16 같은 dtype이 유지되도록 원래 dtype을 기억
         original_dtype = cache_k.dtype
         
-        # Transform K: each destination layer is a weighted combination of all source layers
+        # K 변환: 각 도착 층은 여러 원본 층을 가중합해서 만든다.
         # k_new[dest] = sum_src(k_coeffs[dest, src] * cache_k[src]) + k_bias[dest]
         # Einsum: [dest, src] @ [src, batch, seq, heads, dim] -> [dest, batch, seq, heads, dim]
         k_new = jnp.einsum('ds,sbtkh->dbtkh', self.k_coeffs.value, cache_k)
         k_new = k_new + self.k_bias.value[:, None, None, :, :]  # Add bias
         
-        # Transform V (same operation, independent parameters)
+        # V도 같은 방식으로 계산하지만 파라미터는 따로 가진다.
         v_new = jnp.einsum('ds,sbtkh->dbtkh', self.v_coeffs.value, cache_v)
         v_new = v_new + self.v_bias.value[:, None, None, :, :]
         
-        # Cast back to original dtype
+        # 마지막에 원래 dtype으로 다시 맞춘다.
         k_new = k_new.astype(original_dtype)
         v_new = v_new.astype(original_dtype)
         
@@ -94,13 +99,13 @@ class PiBehavior(_model.BaseModel):
     def __init__(self, config: pi_behavior_config.PiBehaviorConfig, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         
-        # Store config for later use
+        # 나중에 여러 곳에서 참조할 설정을 저장
         self.config = config
         
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         
-        # Initialize Gemma models with AdaRMS (Pi05 style)
+        # Pi0.5 방식에 맞춰 Gemma 계열 모듈을 초기화
         llm = nnx_bridge.ToNNX(
             _gemma.Module(
                 configs=[paligemma_config, action_expert_config],
@@ -110,7 +115,7 @@ class PiBehavior(_model.BaseModel):
         )
         llm.lazy_init(rngs=rngs, method="init", use_adarms=[False, True])
         
-        # Initialize vision model
+        # vision backbone 초기화
         img = nnx_bridge.ToNNX(
             _siglip.Module(
                 num_classes=paligemma_config.width,
@@ -124,8 +129,8 @@ class PiBehavior(_model.BaseModel):
         
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
         
-        # KV cache transformation for cross-layer attention
-        # Allows action expert to attend to learned combinations of VLM layers
+        # 층 사이 attention을 섞어 주는 KV 변환 모듈
+        # action expert가 VLM 여러 층의 정보를 섞어 보게 한다.
         if config.use_kv_transform:
             self.kv_transform = KVCacheTransform(
                 num_layers=paligemma_config.depth,
@@ -136,78 +141,78 @@ class PiBehavior(_model.BaseModel):
         else:
             self.kv_transform = None
         
-        # Task embeddings table - trainable embeddings for each task
+        # 태스크별 학습 가능한 embedding 표
         self.task_embeddings = nnx.Embed(
             num_embeddings=config.num_tasks,
             features=config.task_embedding_dim,
             rngs=rngs,
         )
         
-        # Stage predictor - predicts stage from VLM output of base task token
-        # Outputs MAX_NUM_STAGES logits, but invalid stages are masked per task
+        # 현재 stage를 예측하는 분기
+        # 모든 stage logit을 내지만, 해당 task에 없는 stage는 mask로 막는다.
         self.stage_pred_from_vlm = nnx.Linear(paligemma_config.width, MAX_NUM_STAGES, rngs=rngs)
         
-        # Task + subtask fusion layers
-        # Combines task embedding + cos/sin encoded subtask state
-        self.subtask_encoding_dim = config.task_embedding_dim // 2  # Half of task embedding dim (1024)
+        # task 정보와 subtask 정보를 합치는 층
+        # task embedding과 subtask의 sin/cos 표현을 합친다.
+        self.subtask_encoding_dim = config.task_embedding_dim // 2  # task embedding 차원의 절반
         
-        # Task-specific stage embeddings (one per stage per task)
-        # Total embeddings = sum of stages across all tasks (596 for 5-15 stages per task)
+        # task마다 stage별 embedding을 따로 둔다.
+        # 전체 임베딩 개수는 모든 task의 stage 수를 더한 값
         self.task_stage_embeddings = nnx.Embed(
             num_embeddings=TOTAL_TASK_STAGE_EMBEDDINGS,
             features=self.subtask_encoding_dim,
             rngs=rngs,
         )
         
-        # Gated fusion layers
-        # Input: task_embedding + sincos + task_stage_emb = task_dim + 2*subtask_dim
+        # 여러 정보를 얼마나 섞을지 gate로 조절하는 층
+        # 입력은 task embedding + sin/cos + task-stage embedding의 결합
         fusion_input_dim = config.task_embedding_dim + 2 * self.subtask_encoding_dim
         
-        # Gate networks to learn how to combine different signals
+        # 어떤 신호를 얼마나 반영할지 gate가 학습한다.
         self.gate_sincos = nnx.Linear(fusion_input_dim, self.subtask_encoding_dim, rngs=rngs)
         self.gate_task_stage = nnx.Linear(fusion_input_dim, self.subtask_encoding_dim, rngs=rngs)
         self.gate_task = nnx.Linear(fusion_input_dim, config.task_embedding_dim, rngs=rngs)
         
-        # Fusion networks to create multiple conditioned vectors
+        # 여러 종류의 조건부 표현 벡터를 만든다.
         self.fusion_layer1 = nnx.Linear(fusion_input_dim, config.task_embedding_dim * 2, rngs=rngs)
         self.fusion_layer2 = nnx.Linear(config.task_embedding_dim * 2, config.task_embedding_dim, rngs=rngs)
         
-        # Additional projection for stage-dominant representation (2 signals now)
+        # stage 쪽 정보를 더 강하게 반영한 표현을 만드는 투영층
         self.stage_projection = nnx.Linear(2 * self.subtask_encoding_dim, config.task_embedding_dim, rngs=rngs)
         
-        # Pi05 style layers
+        # Pi0.5 스타일의 action/time 관련 층
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
-        # Correlated noise generation
-        # Initialize as NNX Intermediate (excluded from checkpoints, loaded from norm_stats)
-        # Full correlation matrix with beta shrinkage for robustness
+        # correlated noise 관련 설정
+        # 체크포인트에는 직접 저장하지 않고, norm_stats에서 읽어 올 수 있게 둔다.
+        # 안정성을 위해 shrinkage를 적용한 상관행렬 사용
         flat_dim = config.action_horizon * config.action_dim
         self.action_correlation_cholesky = nnx.Intermediate(
-            jnp.eye(flat_dim),  # Identity matrix as placeholder
+            jnp.eye(flat_dim),  # 아직 불러오기 전에는 단위행렬을 임시값으로 둔다.
         )
-        self.correlation_loaded = False  # Track if correlation matrix has been loaded
+        self.correlation_loaded = False  # 상관행렬을 실제로 불러왔는지 표시
         self.use_correlated_noise = config.use_correlated_noise
         self.correlation_beta = config.correlation_beta  # Shrinkage parameter for regularization
         
-        # Inpainting cache: stores precomputed matrices for simple correlation-based inpainting
-        # Key: num_inpainted_steps (length of inpainted sequence)
-        # Value: dict with {O_indices, U_indices, Sigma_UO_SOOinv}
+        # inpainting에 필요한 행렬을 미리 계산해 저장해 두는 캐시
+        # key는 inpainted step 길이
+        # value는 보정 계산에 필요한 인덱스/행렬 묶음
         self.inpainting_cache = {}
         
-        # FAST auxiliary training components
+        # FAST 보조 학습에 필요한 구성요소
         if config.use_fast_auxiliary:
-            # FAST embedding layer (vocab_size → paligemma_width)
-            # Use paligemma width (2048) to match other prefix tokens
+            # FAST 토큰 임베딩 층
+            # 다른 prefix 토큰과 차원을 맞추기 위해 paligemma width 사용
             self.fast_token_embedding = nnx.Embed(
                 num_embeddings=config.fast_vocab_size,
                 features=paligemma_config.width,
                 rngs=rngs
             )
             
-            # FAST projection head (paligemma_width → vocab_size)
+            # FAST 토큰 예측용 출력층
             self.fast_token_proj = nnx.Linear(
                 paligemma_config.width,
                 config.fast_vocab_size,
@@ -216,7 +221,7 @@ class PiBehavior(_model.BaseModel):
             
             logger.info(f"FAST auxiliary enabled, vocab_size={config.fast_vocab_size}")
 
-        # This attribute gets automatically set by model.train() and model.eval().
+        # train()/eval() 호출에 따라 자동으로 바뀌는 플래그
         self.deterministic = True
 
     def encode_subtask_state(

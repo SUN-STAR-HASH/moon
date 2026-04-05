@@ -18,8 +18,8 @@ from b1k.models.observation import Observation
 if TYPE_CHECKING:
     from b1k.models.pi_behavior import PiBehavior
 
-# Per-task stage counts (based on avg_episode_length / 900, capped between 5-15)
-# Use tuple for immutability and to avoid JAX device allocation at import time
+# 태스크별 stage 개수. 데모 길이를 바탕으로 5~15 범위에서 정해 둔 값
+# tuple로 두면 바뀌지 않고, import 시점에 불필요한 JAX 메모리 할당도 줄일 수 있다.
 TASK_NUM_STAGES = (
     5, 6, 15, 15, 14, 12, 9, 15, 10, 15,  # Tasks 0-9
     7, 13, 10, 15, 15, 15, 15, 11, 13, 12,  # Tasks 10-19
@@ -47,6 +47,7 @@ class PiBehaviorConfig(_model.BaseModelConfig):
     max_token_len: int = 200  # Only used for compatibility, not for actual tokenization
 
     # Number of tasks in the behavior dataset
+    # 기존 웨이트를 그대로 쓰기 위해 반드시 50을 유지한다.
     num_tasks: int = 50
 
     # Task embedding dimension - will match the paligemma width
@@ -58,20 +59,20 @@ class PiBehaviorConfig(_model.BaseModelConfig):
     # Path to task data JSON file for initialization
     task_data_path: str = "b1k/BEHAVIOR-1K/docs/challenge/task_data.json"
 
-    # Whether to use correlated noise matching action covariance structure
-    # Requires correlation matrix in norm_stats (computed by compute_norm_stats.py)
+    # 행동 간 상관관계를 반영한 correlated noise를 사용할지 여부
+    # 사용하려면 norm_stats 안에 상관행렬 정보가 미리 들어 있어야 한다.
     use_correlated_noise: bool = False
 
-    # Shrinkage parameter for correlation regularization
-    # Applied as: S_regularized = beta * S + (1-beta) * I
-    # beta=1.0 means full correlation (no shrinkage)
-    # beta=0.7 means 70% correlation + 30% independence (recommended for robustness)
-    # beta=0.0 means independence (no correlation)
+    # 상관행렬을 너무 강하게 믿지 않도록 섞는 비율
+    # 실제 계산은 beta * S + (1-beta) * I 형태로 한다.
+    # beta=1.0이면 상관행렬을 그대로 사용
+    # beta=0.7이면 상관관계 70%, 독립 잡음 30%를 섞는다.
+    # beta=0.0이면 완전히 독립 잡음만 사용
     correlation_beta: float = 0.5
 
-    # FAST auxiliary training configuration
-    use_fast_auxiliary: bool = False  # Enable FAST during training
-    fast_loss_weight: float = 0.1  # Weight for FAST loss (vs flow loss)
+    # FAST 보조 학습 관련 설정
+    use_fast_auxiliary: bool = False  # 학습 시 FAST 보조 경로를 켤지 여부
+    fast_loss_weight: float = 0.1  # 전체 손실에서 FAST 손실 비중
 
     # Action dimensions to encode with FAST (default: 0:6, 7:23 = 22 dims)
     # Format: "0:6,7:23" or list of tuples [(0, 6), (7, 23)]
@@ -86,22 +87,22 @@ class PiBehaviorConfig(_model.BaseModelConfig):
     # FAST tokenizer path (set during initialization, relative to assets_dir/asset_id)
     fast_tokenizer_path: str | None = None
 
-    # KV cache transformation for cross-layer attention between VLM and action expert
-    # Allows each action expert layer to attend to a learned combination of all VLM layers
+    # VLM 층과 action expert 층 사이의 KV cache를 섞는 기능
+    # 각 action expert 층이 VLM 여러 층의 정보를 섞어 보게 한다.
     use_kv_transform: bool = False
 
-    # Knowledge insulation: stop action expert gradients from flowing to VLM backbone
-    # VLM trains on FAST tokens only, action expert on flow matching with frozen VLM features
+    # action expert의 gradient가 VLM 본체로 흘러가는 것을 막는 옵션
+    # VLM은 FAST 쪽만, action expert는 flow matching 쪽만 보도록 분리할 때 쓴다.
     use_knowledge_insulation: bool = False
 
-    # Subtask/stage prediction auxiliary loss weight (relative to action loss)
+    # subtask/stage 예측 보조 손실의 가중치
     subtask_loss_weight: float = 0.0
 
-    # Time threshold for inpainting during inference
-    # Stop enforcing inpainting constraint when t < threshold (let model be free in final steps)
+    # 추론 중 inpainting 제약을 언제 풀지 정하는 기준
+    # t가 이 값보다 작아지면 마지막 단계에서는 모델이 더 자유롭게 행동하게 둔다.
     time_threshold_inpaint: float = 0.3
 
-    # Vision backbone finetuning control
+    # vision backbone을 고정할지 여부
     freeze_vision_backbone: bool = True
 
     def __post_init__(self):
@@ -110,7 +111,12 @@ class PiBehaviorConfig(_model.BaseModelConfig):
             object.__setattr__(self, "task_embedding_dim", paligemma_config.width)
 
     def get_fast_dim_ranges(self) -> list[tuple[int, int]]:
-        """Parse fast_encoded_dims into list of ranges."""
+        """PI_BEHAVIOR 모델 설정 파일.
+
+주의:
+- 실제로는 12개 태스크만 써도, 모델 파라미터 모양은 원래 50개 태스크 기준을 유지해야 한다.
+- 이 파일에서 num_tasks, action_horizon 같은 값을 함부로 줄이면 기존 웨이트를 그대로 불러올 수 없게 된다.
+"""
         if isinstance(self.fast_encoded_dims, str):
             ranges = []
             for range_str in self.fast_encoded_dims.split(','):
