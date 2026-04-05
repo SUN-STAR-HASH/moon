@@ -37,6 +37,16 @@ from b1k.models.pi_behavior_config import (
 logger = logging.getLogger("b1k")
 
 
+# VLM prefix에서 나온 여러 layer의 KV cache를 action expert가 그대로 1:1로 보는 대신,
+# "여러 layer를 섞은 새로운 cache"를 보게 하는 모듈이다.
+#
+# 핵심 의도:
+# - action expert가 특정 단일 layer 정보에만 묶이지 않게 하고,
+# - 여러 VLM layer 표현을 조합해 더 유연하게 참조하게 만드는 것.
+#
+# 다만 실험 안정성을 위해 초기값은 identity로 둔다.
+# 즉, 학습 초반에는 "없는 것과 거의 같은 상태"에서 시작하고,
+# 필요할 때만 점진적으로 의미 있는 mixing을 배우게 한다.
 class KVCacheTransform(nnx.Module):
     """여러 층의 KV cache를 섞어 새로운 KV cache를 만드는 모듈.
     
@@ -127,6 +137,12 @@ class PiBehavior(_model.BaseModel):
         )
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
         
+        # 전체 모델은 크게 두 덩어리로 보면 된다.
+        # 1) PaliGemma/SigLIP 기반 prefix 처리부(이미지/태스크/상태 이해)
+        # 2) action expert 기반 suffix 처리부(노이즈가 섞인 action 복원)
+        #
+        # 즉, prefix는 "조건(condition)을 만들고",
+        # suffix는 "그 조건을 보고 action trajectory를 예측"하는 구조다.
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
         
         # 층 사이 attention을 섞어 주는 KV 변환 모듈
@@ -148,6 +164,16 @@ class PiBehavior(_model.BaseModel):
             rngs=rngs,
         )
         
+        # stage prediction branch.
+        # 현재 base task token의 표현으로부터 현재 subtask/stage를 분류하도록 만든다.
+        #
+        # 중요한 점은:
+        # - 출력은 MAX_NUM_STAGES 전체에 대해 만들지만,
+        # - 실제로는 task마다 가능한 stage 수가 다르므로
+        #   뒤에서 invalid stage를 mask 처리한다.
+        #
+        # 따라서 이 층은 "고정된 head 하나로 모든 task를 다룬다"는 단순함과,
+        # "task별 stage 개수 차이"를 mask로 해결한다는 타협을 같이 가진다.
         # 현재 stage를 예측하는 분기
         # 모든 stage logit을 내지만, 해당 task에 없는 stage는 mask로 막는다.
         self.stage_pred_from_vlm = nnx.Linear(paligemma_config.width, MAX_NUM_STAGES, rngs=rngs)
@@ -224,6 +250,17 @@ class PiBehavior(_model.BaseModel):
         # train()/eval() 호출에 따라 자동으로 바뀌는 플래그
         self.deterministic = True
 
+    # subtask_state를 그냥 정수 id로 쓰지 않고,
+    # task별 stage 개수를 반영해 [0, 1] 범위로 정규화한 뒤 sin/cos positional encoding으로 바꾼다.
+    #
+    # 이렇게 하는 이유:
+    # - stage 3이라는 숫자의 절대값보다,
+    #   "현재 task 진행률이 어느 정도인가"를 더 잘 표현하기 위해서다.
+    # - task마다 stage 개수가 다르므로,
+    #   같은 stage index라도 의미가 달라질 수 있다.
+    #
+    # 즉, 이 함수는 stage를 "카테고리"가 아니라
+    # "task 진행 위치"처럼 표현하기 위한 인코더다.
     def encode_subtask_state(
         self, 
         subtask_state: at.Int[at.Array, " b"],
@@ -255,6 +292,15 @@ class PiBehavior(_model.BaseModel):
             max_period=1.0
         )
 
+    # correlated noise를 쓸 때 필요한 action covariance 정보를 norm_stats에서 불러오는 함수.
+    # 단순히 행렬을 읽는 것에서 끝나지 않고,
+    # beta shrinkage를 적용해 수치적으로 더 안정한 공분산으로 바꾼 뒤 Cholesky를 다시 계산한다.
+    #
+    # 이 처리가 필요한 이유:
+    # - 실측 covariance는 노이즈가 많거나 ill-conditioned할 수 있고,
+    # - 그대로 쓰면 Cholesky 분해나 샘플링에서 불안정해질 수 있기 때문이다.
+    #
+    # 즉, 이 함수는 "통계 로드" + "수치 안정화"를 같이 담당한다.
     def load_correlation_matrix(self, norm_stats: dict):
         """Load full correlation matrix from normalization statistics and apply shrinkage.
         
@@ -454,6 +500,17 @@ class PiBehavior(_model.BaseModel):
             'correction_matrix': correction_matrix,  # Σ_{UO}Σ_{OO}^{-1}
         }
 
+    # base task embedding 하나만 쓰지 않고,
+    # subtask 정보를 여러 방식으로 섞은 4개의 조건 벡터를 만든다.
+    #
+    # 여기서 만드는 표현은 대략 다음 역할을 가진다.
+    # 1) task_gated: 원래 task embedding을 stage 정보로 조절한 표현
+    # 2) balanced_fusion: task + subtask를 균형 있게 합친 표현
+    # 3) stage_dominant: stage 쪽 정보를 더 강하게 반영한 표현
+    # 4) pure_stage: 순수하게 stage 정보 위주 표현
+    #
+    # 즉, 모델이 "task는 같지만 stage가 다를 때"를
+    # 한 가지 표현만으로 억지로 처리하지 않도록, 여러 시각의 조건 벡터를 제공하는 구간이다.
     def fuse_task_and_subtask(
         self, task_embedding: at.Float[at.Array, "b d"], task_ids: at.Int[at.Array, " b"], subtask_state: at.Int[at.Array, " b"]
     ) -> at.Float[at.Array, "b n d"]:
@@ -522,6 +579,18 @@ class PiBehavior(_model.BaseModel):
         return fused_embeddings
 
     @at.typecheck
+    # prefix를 구성하는 핵심 함수.
+    # 현재 구현에서 prefix는
+    # 1) 이미지 토큰
+    # 2) task / subtask 토큰
+    # 3) 상태(state) 토큰
+    # 4) optional FAST 토큰
+    # 순서로 쌓인다.
+    #
+    # 중요한 점은 task token을 하나만 넣는 게 아니라,
+    # base task token + stage-conditioned task tokens를 함께 넣는다는 점이다.
+    # 그래서 prefix 자체가 "현재 무슨 task인가"뿐 아니라
+    # "그 task 안에서 지금 어느 단계인가" 정보도 같이 들고 있게 된다.
     def embed_prefix(
         self, 
         obs: Observation
@@ -567,11 +636,20 @@ class PiBehavior(_model.BaseModel):
         # Add task embeddings with subtask state fusion
         if obs.tokenized_prompt is not None:
             # obs.tokenized_prompt now contains task_ids (shape: [batch_size, 2])
+            # tokenized_prompt는 일반적인 자연어 prompt가 아니라,
+            # 현재 구현에서는 [task_id, subtask_state] 형식의 구조화 입력으로 사용한다.
+            # 즉, 이름은 prompt지만 실제 의미는 "task/stage conditioning payload"에 가깝다.
             task_ids = obs.tokenized_prompt[:, 0]  # Extract task_id: [batch_size]
             base_task_embedding = self.task_embeddings(task_ids)  # shape: [batch_size, embed_dim]
             
             # ALWAYS use the input subtask state - never use predicted state inside model
             if obs.tokenized_prompt.shape[1] > 1:  # If we have [task_id, subtask_state]
+                # 현재 모델은 내부에서 예측한 stage를 다시 prefix 구성에 재주입하지 않는다.
+                # 항상 입력으로 들어온 subtask_state를 그대로 사용한다.
+                #
+                # 이유:
+                # - 학습 중 자기 예측값을 다시 쓰면 teacher forcing 구조가 불안정해질 수 있고,
+                # - 오류가 누적되면 stage prediction branch와 action prediction branch가 같이 흔들릴 수 있기 때문이다.
                 subtask_state = obs.tokenized_prompt[:, 1]  # Use input subtask state
             else:
                 raise ValueError("subtask_state must be provided in tokenized_prompt for PI_BEHAVIOR model")
@@ -592,6 +670,12 @@ class PiBehavior(_model.BaseModel):
             # Hierarchical attention: base task (False) then stage tokens (True, False, False, False)
             # Base task attends to images bidirectionally
             # Stage tokens attend to images+task but not vice versa
+            # task token들의 attention 방향을 수동으로 설계하는 부분.
+            # base task token은 이미지와 양방향으로 상호작용하게 두고,
+            # stage-conditioned token들은 계층적으로 정보를 받도록 만든다.
+            #
+            # 즉, 모든 토큰을 완전 대칭으로 섞는 대신,
+            # "base task -> stage-conditioned variants"라는 구조를 attention mask로 반영한다.
             ar_mask += [False] + [True, False, False, False]
             
         # Add state as discrete tokens (Pi05 style)
@@ -640,6 +724,12 @@ class PiBehavior(_model.BaseModel):
         return tokens, input_mask, ar_mask
 
     @at.typecheck
+    # suffix는 noisy action trajectory와 timestep 정보를 action expert가 읽기 좋은 토큰으로 바꾸는 단계다.
+    # prefix가 조건을 만드는 쪽이라면,
+    # suffix는 flow matching 복원을 실제로 수행하는 쪽이다.
+    #
+    # 특히 timestep은 단순 scalar가 아니라 sin/cos + MLP를 거쳐 adaRMS conditioning에 들어간다.
+    # 그래서 "현재 diffusion/flow 시간 t"가 action expert 전체에 조건으로 작용한다.
     def embed_suffix(
         self, obs: Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
     ) -> tuple[
@@ -685,6 +775,16 @@ class PiBehavior(_model.BaseModel):
         raise NotImplementedError("Use compute_detailed_loss() instead")
 
     @override
+    # 현재 학습의 핵심 loss 함수.
+    # 큰 흐름은 다음과 같다.
+    # 1) prefix를 한 번만 계산해서 KV cache를 만든다.
+    # 2) 필요하면 FAST loss를 여기서 먼저 계산한다.
+    # 3) action expert용으로는 FAST 토큰을 제외한 cache만 남긴다.
+    # 4) num_flow_samples 만큼 서로 다른 noise / time을 뽑아 suffix를 반복 계산한다.
+    # 5) sample별 loss를 평균내어 최종 loss를 만든다.
+    #
+    # 즉, "비싼 prefix 계산은 재사용"하고
+    # "cheap한 flow sample만 여러 번 평가"하도록 짠 구조다.
     def compute_detailed_loss(
         self, rng: at.KeyArrayLike, observation: Observation, actions: _model.Actions, *, train: bool = False, num_flow_samples: int = 1
     ) -> dict[str, at.Float[at.Array, "*b"]]:
@@ -722,6 +822,13 @@ class PiBehavior(_model.BaseModel):
         # Image tokens all have ar_mask=False, task starts with ar_mask=False (base) then True (stage tokens)
         # Structure: [images (all False)] [base_task (False)] [stages (True, False, False, False)]
         # Find first True (first stage token), base task is at that index - 1
+        # stage prediction은 prefix 전체 출력 중 "base task token 위치"를 찾아 그 표현으로 수행한다.
+        # 현재 구현은 ar_mask 패턴을 이용해 첫 stage token 위치를 찾고,
+        # 그 바로 앞 토큰을 base task token으로 해석한다.
+        #
+        # 이 코드는 단순 index 하드코딩이 아니라
+        # prefix 구성 규칙에 의존한 위치 해석 로직이므로,
+        # 나중에 task token 순서를 바꾸면 이 부분도 반드시 같이 수정해야 한다.
         first_stage_token_idx = jnp.argmax(prefix_ar_mask)  # Returns index of first True
         base_task_token_idx = first_stage_token_idx - 1
         base_task_output = prefix_out[:, base_task_token_idx, :]
@@ -783,6 +890,12 @@ class PiBehavior(_model.BaseModel):
         
         # 5. Remove FAST tokens from KV cache (action expert doesn't attend to FAST)
         # KV cache shape: [layers, batch, seq_len, num_kv_heads, head_dim]
+        # FAST auxiliary는 prefix 계산에는 포함되지만,
+        # action expert가 suffix를 생성할 때는 FAST 토큰을 보지 않게 설계했다.
+        # 그래서 prefix KV cache를 만든 뒤, 마지막 FAST 구간을 잘라내고 action branch에 넘긴다.
+        #
+        # 즉, FAST는 "보조 학습 신호"이지
+        # action expert가 직접 참조하는 prefix context는 아니다.
         if fast_len > 0:
             cache_k, cache_v = kv_cache_full
             # Remove last fast_len tokens from sequence dimension
@@ -802,6 +915,12 @@ class PiBehavior(_model.BaseModel):
         # 6. Knowledge insulation: stop gradients from action expert to VLM
         # This must happen BEFORE kv_transform so transform still receives gradients
         if self.config.use_knowledge_insulation:
+            # knowledge insulation이 켜져 있으면
+            # action loss의 gradient가 VLM prefix 쪽으로 역류하지 않게 막는다.
+            # 다만 kv_transform은 그 뒤에 적용하므로, transform 자체는 action 쪽 gradient를 여전히 받을 수 있다.
+            #
+            # 즉, "VLM backbone을 보호"하면서도
+            # "prefix-suffix 사이의 얇은 연결부(kv_transform)는 학습 가능하게 남기는" 절충 구조다.
             kv_cache_for_actions = jax.tree.map(jax.lax.stop_gradient, kv_cache_for_actions)
         
         # 7. Transform KV cache (after stop_gradient, so it receives action expert gradients)

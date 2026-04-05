@@ -68,6 +68,12 @@ def init_logging():
     logger.handlers[0].setFormatter(formatter)
 
 
+# wandb 초기화 함수.
+# 새 실험이면 run id를 저장하고, resume이면 기존 run id를 다시 읽어 같은 실험으로 이어 붙인다.
+#
+# 여기서 중요한 점은 "checkpoint resume"과 "wandb run resume"를 같이 맞춰 준다는 것이다.
+# 둘 중 하나만 이어지고 다른 하나가 새로 시작되면,
+# 로그와 체크포인트 기록이 서로 어긋날 수 있다.
 def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = False, enabled: bool = True):
     if not enabled:
         wandb.init(mode="disabled")
@@ -91,12 +97,24 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
         wandb.run.log_code(epath.Path(__file__).parent.parent)
 
 
+# pretrained / partial checkpoint를 현재 모델 구조에 맞춰 불러오는 함수.
+# 단순 load가 아니라,
+# 1) nnx.Intermediate 같은 비-파라미터 필드를 비교 대상에서 빼고
+# 2) 나머지 파라미터 트리의 shape / dtype 일치를 검사한 뒤
+# 3) 실제로 주입 가능한 subset만 반환한다.
+#
+# 즉, 이 함수의 목적은 "불러오기"보다도
+# "지금 모델 구조와 체크포인트가 안전하게 호환되는지 검증"하는 데 가깝다.
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
     """Loads and validates the weights. Returns a loaded subset of the weights."""
     loaded_params = loader.load(params_shape)
     
     # Filter out nnx.Intermediate fields from both sides (they're not params, excluded from checkpoints)
     # This allows loading old checkpoints that didn't have these fields
+    # Intermediate 필드는 학습 파라미터라기보다
+    # runtime cache / 통계 / 보조 상태에 가까워 체크포인트에 없을 수 있다.
+    # 그래서 이 필드까지 엄격 비교하면,
+    # 실제로는 문제없는 old checkpoint도 shape mismatch처럼 보일 수 있다.
     def filter_intermediate_fields(params_dict):
         flat = traverse_util.flatten_dict(params_dict)
         # List of field names that are nnx.Intermediate (excluded from checkpoints)
@@ -140,6 +158,17 @@ def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shap
 
 
 @at.typecheck
+# 학습 시작에 필요한 TrainState를 만드는 함수.
+# 순서는 대략
+# 1) 모델 생성
+# 2) 필요하면 correlation matrix 로드
+# 3) partial pretrained weights 주입
+# 4) freeze_filter 반영
+# 5) optimizer / EMA state 초기화
+# 이다.
+#
+# 즉, "모델 객체를 만든다"에서 끝나는 게 아니라
+# "현재 실험 설정에 맞는 학습 가능 상태"까지 완성하는 단계다.
 def init_train_state(
     config: _config.TrainConfig, 
     init_rng: at.KeyArrayLike, 
@@ -157,6 +186,11 @@ def init_train_state(
         
         # Load correlation matrix into PiBehavior models BEFORE creating graphdef
         if isinstance(model, PiBehavior) and norm_stats is not None:
+            # correlated noise용 correlation matrix는 graphdef를 고정하기 전에 미리 넣어 둔다.
+            # 그래야 이후 state / sharding / checkpoint 구조가
+            # 이미 correlation 정보가 반영된 형태로 정리된다.
+            #
+            # 나중에 넣으면 model state와 graphdef 타이밍이 어긋나 복잡해질 수 있다.
             model.load_correlation_matrix(norm_stats)
             logging.info("Loaded correlation matrix during model initialization")
 
@@ -222,6 +256,12 @@ def init_train_state(
 
 
 @at.typecheck
+# jitted one-step 학습 함수.
+# 현재 state에서 model을 복원하고,
+# detailed loss를 계산한 뒤,
+# gradient / optimizer update / EMA 갱신까지 한 번에 수행한다.
+#
+# 즉, 이 함수 하나가 "forward + backward + update" 전체를 담당한다.
 def train_step(
     config: _config.TrainConfig,
     rng: at.KeyArrayLike,
@@ -232,6 +272,10 @@ def train_step(
     model.train()
 
     @at.typecheck  
+    # 현재 학습은 model.compute_loss()가 아니라 compute_detailed_loss()를 사용한다.
+    # 이유는 total_loss 외에도
+    # fast_loss, fast_accuracy, subtask 관련 지표 등
+    # 세부 항목을 함께 로깅하기 위해서다.
     def loss_fn(
         model: PiBehavior, rng: at.KeyArrayLike, observation: Observation, actions: _model.Actions
     ):
@@ -247,6 +291,14 @@ def train_step(
     (loss, losses_dict), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(model, train_rng, observation, actions)
     
     # Knowledge insulation gradient monitoring
+    # knowledge insulation을 켰을 때 실제로 gradient가 어느 쪽으로 흐르는지 확인하기 위한 모니터링 코드.
+    # 파라미터 이름 기준으로
+    # - action expert 쪽
+    # - 그 외 VLM 쪽
+    # 을 나눠서 gradient norm을 따로 기록한다.
+    #
+    # 즉, 이 부분은 학습 로직 자체를 바꾸는 게 아니라
+    # "설계한 gradient 차단이 실제로 먹는지"를 관찰하기 위한 계측 장치다.
     if config.model.use_knowledge_insulation:
         # Helper functions to identify parameter groups
         def is_action_expert_param(path_str):
@@ -334,6 +386,13 @@ def train_step(
     return new_state, info
 
 
+# 전체 학습 실행 엔트리포인트.
+# config 검증 -> seed 준비 -> sharding 구성 -> checkpoint/wandb 초기화
+# -> data loader 준비 -> 첫 batch sanity check -> train state 초기화
+# -> ptrain_step 반복 실행
+# 순서로 돌아간다.
+#
+# 즉, train.py를 읽을 때는 main을 "실험 orchestration 스크립트"로 보면 된다.
 def main(config: _config.TrainConfig):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
@@ -373,11 +432,18 @@ def main(config: _config.TrainConfig):
     )
 
     data_iter = iter(data_loader)
+    # 첫 batch를 학습 전에 한 번 바로 뽑아 보는 이유는
+    # data loader / transform / sharding 문제가 있으면 여기서 빨리 터뜨리기 위해서다.
+    # 즉, 긴 초기화가 끝난 뒤 첫 step에서 죽는 것보다
+    # 입력 파이프라인 문제를 가능한 앞단에서 확인하려는 sanity check다.
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     # Log images from first batch to sanity check.
     if config.wandb_enabled:
+        # 첫 batch의 카메라 이미지를 wandb에 남겨
+        # "입력 shape는 맞는데 내용이 뒤집히거나 채널 순서가 이상한" 문제를 빠르게 잡기 위한 시각적 sanity check다.
+        # 다만 smoke/debug 환경에서는 오버헤드가 될 수 있어 wandb_enabled일 때만 수행한다.
         images_to_log = [
             wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
             for i in range(min(5, len(next(iter(batch[0].images.values())))))
@@ -386,6 +452,12 @@ def main(config: _config.TrainConfig):
         
     # Get norm_stats for correlation matrix loading
     data_config = data_loader.data_config()
+    # 기본적으로 correlated noise / normalization 흐름을 위해 norm_stats를 요구한다.
+    # 하지만 fake smoke는 실제 데이터셋 검증이 아니라 구조 smoke가 목적이므로,
+    # repo_id == "fake"일 때만 이 요구사항을 예외적으로 완화한다.
+    #
+    # 즉, "norm_stats가 없어도 괜찮다"가 아니라
+    # "fake smoke라는 특수한 디버그 경로에서만 통과시킨다"는 예외 처리다.
     if data_config.norm_stats is None:
         if data_config.repo_id == "fake":
             logging.warning(
@@ -404,6 +476,12 @@ def main(config: _config.TrainConfig):
     jax.block_until_ready(train_state)
     logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
 
+    # 저장은 save_interval마다 하되,
+    # 시작 step 바로 직후의 중복 저장은 피하고,
+    # 마지막 step은 interval과 무관하게 반드시 저장한다.
+    #
+    # 그래서 smoke처럼 짧은 실험에서도
+    # 최소 한 번은 복구 가능한 checkpoint가 남도록 한다.
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
         

@@ -29,6 +29,13 @@ from b1k.configs.task_subset import SELECTED_TASKS
 logger = logging.getLogger(__name__)
 
 
+# 전체 50개 task 구조는 유지하되, 실제 학습 데이터는 선택한 subset만 쓰기 위한 필터다.
+# 즉 "모델 구조를 12-task로 줄이는 것"이 아니라,
+# "데이터셋에서 특정 task만 남기는 것"에 가깝다.
+#
+# dataset 구현체마다 내부에 실제 Hugging Face dataset이 들어있는 필드명이 다를 수 있어서
+# hf_dataset / dataset 순서로 찾아본다.
+# 내부 dataset 객체를 찾지 못하면 학습을 아예 깨지 않기 위해 경고만 남기고 원본을 반환한다.
 def _filter_to_selected_tasks(dataset, allowed_task_ids):
     """선택한 태스크만 남기는 간단한 필터.
 
@@ -53,6 +60,14 @@ def _filter_to_selected_tasks(dataset, allowed_task_ids):
     return dataset
 
 
+# OpenPI 기본 DataLoader는 openpi 쪽 Observation 형식을 기준으로 동작한다.
+# 그런데 현재 우리 학습 루프(train_step)는 b1k.models.observation.Observation을 기대한다.
+# 그래서 여기서는 배치를 그대로 넘기지 않고, Observation.from_dict(batch)로 한 번 감싸서
+# "우리 프로젝트가 기대하는 입력 형식"으로 맞춘 뒤 (Observation, actions) 튜플로 반환한다.
+#
+# 이 래퍼가 없으면
+# 1) OpenPI Observation / B1K Observation 타입 불일치가 생길 수 있고,
+# 2) fast_tokens 같이 B1K 쪽에서 확장한 필드가 학습 코드로 자연스럽게 전달되지 않을 수 있다.
 class DataLoaderImpl(_openpi_data_loader.DataLoader):
     """우리 프로젝트용 Observation 형식으로 배치를 바꿔서 내보내는 DataLoader.
 
@@ -120,6 +135,12 @@ def _build_delta_timestamps(
     }
 
 
+# OmniGibson 버전에 따라 BehaviorLeRobotDataset의 import 경로가 달라질 수 있다.
+# 그래서 한 경로를 고정으로 믿지 않고, 후보 import 경로들을 순서대로 시도한다.
+#
+# 이 함수가 필요한 이유는:
+# - 연구실/서버/개인 PC마다 OmniGibson 버전 차이가 날 수 있고
+# - 같은 코드라도 환경에 따라 import 에러가 날 수 있기 때문이다.
 def _get_behavior_lerobot_dataset_cls():
     """Import BehaviorLeRobotDataset from any known OmniGibson path.
 
@@ -142,6 +163,16 @@ def _get_behavior_lerobot_dataset_cls():
     return None
 
 
+# BehaviorLeRobotDataset 생성자 시그니처는 버전마다 조금씩 다를 수 있다.
+# 그래서 kwargs를 한 번에 고정하지 않고,
+# "가장 많은 옵션을 주는 경우"부터 "최소 인자만 주는 경우"까지 순서대로 시도한다.
+#
+# 여기서 중요한 포인트는:
+# - download_videos=False 로 스모크 테스트 부담을 줄이고,
+# - episodes / root / local_only 같은 옵션이 환경에 따라 안 먹을 수 있으므로
+#   TypeError를 기준으로 안전하게 fallback 한다는 점이다.
+#
+# 즉, 이 함수는 데이터셋 생성 자체보다 "환경 차이를 견디는 호환 레이어" 역할이 더 크다.
 def _instantiate_behavior_dataset(
     dataset_cls,
     repo_id: str,
@@ -220,6 +251,12 @@ def _instantiate_behavior_dataset(
     )
 
 
+# 랩탑 스모크 환경에서는 LeRobot fallback을 의도적으로 막아 둔다.
+# 이유는 fallback 경로가 로컬 데이터만 읽는 것처럼 보여도,
+# 실제로는 Hugging Face metadata 조회나 원격 다운로드를 건드릴 수 있기 때문이다.
+#
+# 즉, "OmniGibson이 없으면 그냥 더 느리게라도 진행"이 아니라,
+# "잘못하면 원격 접근으로 흐름이 꼬이므로 여기서 명시적으로 중단"하는 정책이다.
 def _instantiate_fallback_lerobot_dataset(
     repo_id: str,
     root: str | None,
@@ -231,6 +268,16 @@ def _instantiate_fallback_lerobot_dataset(
     )
 
 
+# 이 파일의 핵심 분기점.
+# - repo_id == "fake" 이면 OmniGibson 없이도 돌아가는 smoke용 가짜 데이터셋을 만든다.
+# - 그 외에는 실제 BehaviorLeRobotDataset을 생성한다.
+#
+# fake dataset의 목적은 "정확한 데이터 재현"이 아니라
+# "기존 transform / batching / model forward 파이프라인이 기대하는 raw schema를 흉내 내는 것"이다.
+# 그래서 3개 RGB 카메라, 256차원 proprio, 23차원 action, task/timestamp 관련 키를 맞춰 준다.
+#
+# 여기서 action을 23차원으로 두는 이유는 원본 B1K 흐름을 흉내 내기 위해서이고,
+# 이후 transform 단계에서 32차원으로 padding 되도록 설계되어 있다.
 def create_behavior_dataset(
     data_config: _config.DataConfig,
     action_horizon: int,
@@ -262,6 +309,12 @@ def create_behavior_dataset(
             def __init__(self, episodes):
                 self.episodes = episodes
 
+        # smoke test용 최소 fake dataset.
+        # 이 데이터셋의 목적은 "학습 성능 확인"이 아니라
+        # "data_loader -> transform -> model 입력 형식이 끝까지 이어지는지 확인"이다.
+        #
+        # 따라서 값 자체는 랜덤이어도 괜찮지만,
+        # key 이름과 shape는 실제 파이프라인이 기대하는 형태와 최대한 같아야 한다.
         class _LaptopFakeBehaviorDataset:
             """Smoke test용 경량 fake dataset.
 
@@ -341,6 +394,11 @@ def create_behavior_dataset(
     # 나중엔 _get_behavior_lerobot_dataset_cls()를 써서 더 안전하게 바꿀 수 있음
     from omnigibson.learning.datas.lerobot_dataset import BehaviorLeRobotDataset
 
+    # 현재 실데이터 로더는 BEHAVIOR task 이름 목록을 명시적으로 넘겨준다.
+    # 이렇게 해 두면 task 순서/구성이 코드에서 고정되어,
+    # 나중에 subset 매핑이나 task_index 해석이 달라지는 문제를 줄일 수 있다.
+    #
+    # 즉, "어떤 task를 쓰는지"를 외부 상태에 맡기지 않고 코드 안에 고정하는 구간이다.
     tasks = [
         "picking_up_trash",
         "putting_away_Halloween_decorations",
@@ -418,6 +476,12 @@ def create_behavior_dataset(
     return dataset
 
 
+# 실제 데이터셋 생성 이후에는 OpenPI의 transform_dataset / TorchDataLoader 파이프라인을 최대한 재사용한다.
+# 즉, 우리 수정의 핵심은 "dataset source만 바꾸고",
+# batching / sharding / worker 처리 방식은 기존 OpenPI 흐름을 따르는 것이다.
+#
+# 이 구조 덕분에 데이터 원천(BEHAVIOR)만 교체하면서도
+# 학습 루프 쪽 코드를 크게 다시 쓰지 않을 수 있다.
 def create_behavior_torch_data_loader(
     data_config: _config.DataConfig,
     model_config: _model.BaseModelConfig,
@@ -479,6 +543,12 @@ def create_behavior_torch_data_loader(
     return DataLoaderImpl(data_config, data_loader)
 
 
+# train.py에서 실제로 호출하는 최종 진입점.
+# config에서 DataConfig를 만든 뒤,
+# RLDS 경로면 OpenPI 기본 로더로 보내고,
+# B1K 경로면 우리가 만든 behavior 전용 torch data loader로 보낸다.
+#
+# 즉, 이 함수는 "데이터셋 종류에 따라 어느 로더를 탈지 결정하는 스위치" 역할이다.
 def create_behavior_data_loader(
     config: _config.TrainConfig,
     *,
