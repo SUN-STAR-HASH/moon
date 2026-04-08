@@ -10,6 +10,7 @@
 
 import logging
 import pathlib
+import os
 
 import einops
 import flax.nnx as nnx
@@ -249,6 +250,13 @@ class PiBehavior(_model.BaseModel):
 
         # train()/eval() 호출에 따라 자동으로 바뀌는 플래그
         self.deterministic = True
+
+    # 4/8 추가 ############
+    def _debug_trace(self, msg: str):
+        """환경변수 B1K_DEBUG_TRACE=1 일 때만 trace 로그를 찍는다."""
+        if os.environ.get("B1K_DEBUG_TRACE", "0") == "1":
+            logger.info(f"[TRACE] {msg}")
+    ########################
 
     # subtask_state를 그냥 정수 id로 쓰지 않고,
     # task별 stage 개수를 반영해 [0, 1] 범위로 정규화한 뒤 sin/cos positional encoding으로 바꾼다.
@@ -721,6 +729,16 @@ class PiBehavior(_model.BaseModel):
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
+        # 4/8 추가 ########
+        # prefix 토큰이 실제로 몇 개 만들어졌는지 확인
+        # 여기까지 찍히면 이미지 / task / state / FAST token 준비는 성공한 것
+        self._debug_trace(
+            f"embed_prefix done: "
+            f"tokens={tokens.shape}, "
+            f"input_mask={input_mask.shape}, "
+            f"ar_mask={ar_mask.shape}"
+        )
+        ###################
         return tokens, input_mask, ar_mask
 
     @at.typecheck
@@ -765,6 +783,17 @@ class PiBehavior(_model.BaseModel):
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
+        # 4/8 추가 ############3
+        # suffix(action 쪽) 토큰이 제대로 만들어졌는지 확인
+        # 여기까지 찍히면 action/noisy action + timestep 임베딩 준비는 성공
+        self._debug_trace(
+            f"embed_suffix done: "
+            f"tokens={tokens.shape}, "
+            f"input_mask={input_mask.shape}, "
+            f"ar_mask={ar_mask.shape}, "
+            f"adarms_cond={adarms_cond.shape}"
+        )
+        #######################
         return tokens, input_mask, ar_mask, adarms_cond
 
     @override
@@ -808,6 +837,17 @@ class PiBehavior(_model.BaseModel):
         # 1. Embed prefix once (includes FAST tokens if provided in observation)
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         
+        # 4/8 추가 #########
+        # prefix 토큰 생성 직후 trace
+        # 여기까지 오면 입력 토큰화 자체는 통과한 것
+        self._debug_trace(
+            f"after embed_prefix: "
+            f"prefix_tokens={prefix_tokens.shape}, "
+            f"prefix_mask={prefix_mask.shape}, "
+            f"prefix_ar_mask={prefix_ar_mask.shape}"
+        )
+        ####################
+
         # 2. Compute prefix KV cache
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions_prefix = jnp.cumsum(prefix_mask, axis=1) - 1
@@ -816,6 +856,16 @@ class PiBehavior(_model.BaseModel):
             mask=prefix_attn_mask,
             positions=positions_prefix
         )
+
+        # [4/8 추가] prefix transformer forward + KV cache 생성 완료 확인
+        cache_k, cache_v = kv_cache_full
+        self._debug_trace(
+            f"after prefix llm: "
+            f"prefix_out={prefix_out.shape}, "
+            f"kv_cache_k={cache_k.shape}, "
+            f"kv_cache_v={cache_v.shape}"
+        )
+        ##################
         
         # 3. Predict stage from VLM output of base task token
         # Base task token is the first token after all image tokens
@@ -949,6 +999,16 @@ class PiBehavior(_model.BaseModel):
             # Build attention mask: suffix attends to prefix (without FAST) + itself
             # When using KV cache, mask shape should be [batch, suffix_len, prefix_len + suffix_len]
             suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+
+            # [4/8 추가] flow sample 하나에 대한 suffix 준비 완료 확인
+            self._debug_trace(
+                f"process_one_flow_sample after embed_suffix: "
+                f"suffix_tokens={suffix_tokens.shape}, "
+                f"suffix_mask={suffix_mask.shape}, "
+                f"adarms_cond={adarms_cond.shape}"
+            )
+            ################################
+
             prefix_attn_mask = einops.repeat(
                 prefix_mask_for_actions, "b p -> b s p", s=suffix_tokens.shape[1]
             )
@@ -966,6 +1026,13 @@ class PiBehavior(_model.BaseModel):
                 adarms_cond=[None, adarms_cond]
             )
             
+            # [4/8 추가] action expert 쪽 suffix forward 완료 확인
+            # 여기까지 찍히면 최소한 forward는 suffix transformer까지 통과한 것
+            self._debug_trace(
+                f"after suffix llm: suffix_out={suffix_out.shape}"
+            )
+            ######################
+
             # Compute velocity and loss
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon:])
             action_loss = jnp.square(v_t - u_t)  # [B, H, D]

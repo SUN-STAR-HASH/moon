@@ -4,6 +4,7 @@ Training script for BEHAVIOR-1K solution.
 Based on https://github.com/PhysicalIntelligence/openpi/blob/behavior/openpi/scripts/train.py with custom modifications.
 """
 
+import subprocess # 4/8 
 import dataclasses
 import functools
 import logging
@@ -95,6 +96,42 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
 
     if log_code:
         wandb.run.log_code(epath.Path(__file__).parent.parent)
+
+# 4/8 추가
+def log_gpu_mem(tag: str):
+    """현재 GPU 메모리 사용량을 로그로 찍는다.
+
+    주의:
+    - 이 값은 '모델만의 메모리'가 아니라 현재 GPU 전체 사용량이다.
+    - 그래도 단계별 증감을 보기에는 충분히 유용하다.
+    """
+    try:
+        out = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+        ).strip().splitlines()[0]
+
+        used, total = [int(x.strip()) for x in out.split(",")]
+        logging.info(f"[GPU MEM] {tag}: {used} MiB / {total} MiB")
+    except Exception as e:
+        # nvidia-smi가 없거나 실패해도 학습을 막지는 않게 한다.
+        logging.info(f"[GPU MEM] {tag}: unavailable ({e})")
+
+
+def block_and_log(tag: str, x=None):
+    """JAX 연산을 실제로 끝까지 실행시킨 뒤 메모리 로그를 찍는다.
+
+    JAX는 lazy / async 성격이 있어서,
+    그냥 함수만 호출하면 실제 GPU 계산이 아직 안 끝났을 수 있다.
+    그래서 block_until_ready를 걸어준 뒤 메모리를 보는 게 더 정확하다.
+    """
+    if x is not None:
+        jax.block_until_ready(x)
+    log_gpu_mem(tag)
 
 
 # pretrained / partial checkpoint를 현재 모델 구조에 맞춰 불러오는 함수.
@@ -395,6 +432,25 @@ def train_step(
 # 즉, train.py를 읽을 때는 main을 "실험 orchestration 스크립트"로 보면 된다.
 def main(config: _config.TrainConfig):
     init_logging()
+
+    # 4/8 추가 #############
+    logging.info(f"Running on: {platform.node()}")
+
+    # 프로그램 시작 직후 GPU 사용량
+    log_gpu_mem("start")
+
+    checkpoint_manager, resuming = _checkpoints.initialize_checkpoint_dir(
+    config.checkpoint_dir,
+    keep_period=config.keep_period,
+    overwrite=config.overwrite,
+    resume=config.resume,
+    )
+    init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+
+    # checkpoint manager / wandb 초기화 후 메모리 상태
+    log_gpu_mem("after checkpoint/wandb init")
+    ######################################################
+
     logging.info(f"Running on: {platform.node()}")
 
     if config.batch_size % jax.device_count() != 0:
@@ -437,6 +493,28 @@ def main(config: _config.TrainConfig):
     # 즉, 긴 초기화가 끝난 뒤 첫 step에서 죽는 것보다
     # 입력 파이프라인 문제를 가능한 앞단에서 확인하려는 sanity check다.
     batch = next(data_iter)
+
+    # 4/8 추가 ############
+    # 데이터 로더 생성 자체가 메모리를 얼마나 쓰는지 확인
+    log_gpu_mem("before data_loader create")
+
+    data_loader = _data_loader.create_behavior_data_loader(
+        config,
+        sharding=data_sharding,
+        shuffle=True,
+    )
+
+    log_gpu_mem("after data_loader create")
+
+    data_iter = iter(data_loader)
+
+    # 첫 batch를 실제로 뽑아보는 순간
+    # 여기서 죽으면 dataset / transform / batching 단계 문제일 가능성이 크다.
+    batch = next(data_iter)
+    logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
+
+    log_gpu_mem("after first batch")
+    #######################################
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     # Log images from first batch to sanity check.
@@ -470,9 +548,32 @@ def main(config: _config.TrainConfig):
             )
     norm_stats = data_config.norm_stats
 
+    # 4/8 추가 #########
+    # model init / weight restore / optimizer state 생성 직전 메모리 확인
+    log_gpu_mem("before init_train_state")
+
     train_state, train_state_sharding = init_train_state(
         config, init_rng, mesh, resume=resuming, norm_stats=norm_stats
     )
+
+    # 4/8 추가 #############
+    # 기존 jax.block_until_ready(train_state) 대신 사용
+    # JAX 계산이 실제 끝난 뒤 메모리를 확인하기 위해 block_and_log 사용
+    block_and_log("after init_train_state", train_state)
+
+    # model init / optimizer state / pretrained restore 직전
+    log_gpu_mem("before init_train_state")
+
+    train_state, train_state_sharding = init_train_state(
+        config, init_rng, mesh, resume=resuming, norm_stats=norm_stats
+    )
+
+    # 실제 계산이 끝난 뒤 메모리를 본다.
+    block_and_log("after init_train_state", train_state)
+
+    logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
+    ################################
+
     jax.block_until_ready(train_state)
     logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
 
@@ -485,6 +586,12 @@ def main(config: _config.TrainConfig):
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
         
+        # 4/8 추가 #############
+        # checkpoint restore 직후 메모리 확인
+        # restore 과정에서 파라미터/옵티마 상태가 얼마나 메모리를 먹는지 확인 가능
+        block_and_log("after restore_state", train_state)
+        #######################
+
         # Reload correlation matrix after restore
         model = nnx.merge(train_state.model_def, train_state.params)
         model.load_correlation_matrix(norm_stats)
@@ -497,6 +604,26 @@ def main(config: _config.TrainConfig):
         out_shardings=(train_state_sharding, replicated_sharding),
         donate_argnums=(1,),
     )
+
+    # 4/8 추가 ###########
+    # 첫 학습 step이 실제로 어디서 터지는지 보기 위한 디버그 실행
+    # 위치는 ptrain_step 생성 직후, 본격 loop(start_step/pbar) 전에 둔다.
+    logging.info("[TRACE] about to run first ptrain_step")
+    log_gpu_mem("before first ptrain_step")
+
+    try:
+        # 첫 step을 명시적으로 한 번 실행
+        train_state, info = ptrain_step(train_rng, train_state, batch)
+
+        # loss까지 실제 계산 완료된 뒤 메모리 확인
+        block_and_log("after first ptrain_step", info["loss"])
+
+        logging.info(f"[TRACE] first step loss={float(jax.device_get(info['loss'])):.6f}")
+
+    except Exception:
+        logging.exception("[TRACE] failed during first ptrain_step")
+        raise
+    ##########################
 
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
