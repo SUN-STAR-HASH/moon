@@ -88,7 +88,8 @@ def preprocess_observation(
     image_keys: Sequence[str] = IMAGE_KEYS,
     image_resolution: tuple[int, int] = IMAGE_RESOLUTION,
 ) -> Observation:
-    """이미지 크기를 맞추고, 학습 시에는 증강을 적용하며, FAST 관련 필드는 그대로 보존한다."""    if not set(image_keys).issubset(observation.images):
+    """이미지 크기를 맞추고, 학습 시에는 증강을 적용하며, FAST 관련 필드는 그대로 보존한다."""
+    if not set(image_keys).issubset(observation.images):
         raise ValueError(f"images dict missing keys: expected {image_keys}, got {list(observation.images)}")
 
     batch_shape = observation.state.shape[:-1]

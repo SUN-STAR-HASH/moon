@@ -709,102 +709,6 @@ _CONFIGS = [
     ),
 
     TrainConfig(
-        name="pi_behavior_b1k_laptop_smoke",
-        exp_name="laptop_smoke",
-        project_name="B1K",
-        model=pi_behavior_config.PiBehaviorConfig(
-            action_horizon=30,
-            action_dim=32,
-            use_correlated_noise=False,
-            correlation_beta=0.0,
-            use_fast_auxiliary=False,
-            fast_loss_weight=0.0,
-            use_kv_transform=False,
-            use_knowledge_insulation=False,
-            subtask_loss_weight=0.0,
-            freeze_vision_backbone=True,
-        ),
-        data=LeRobotB1KDataConfig(
-            repo_id="fake",
-            base_config=DataConfig(
-                prompt_from_task=False,
-                behavior_dataset_root=None,
-                use_per_timestamp_norm=False,
-            ),
-            use_delta_joint_actions=False,
-            use_fast_tokenization=False,
-        ),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1,
-            peak_lr=1e-4,
-            decay_steps=2,
-            decay_lr=1e-5,
-        ),
-        num_flow_samples=1,
-        weight_loader=weight_loaders.NoOpWeightLoader(),
-        num_train_steps=2,
-        assets_base_dir="./outputs/assets",
-        checkpoint_base_dir="./outputs/checkpoints",
-        num_workers=0,
-        batch_size=1,
-        save_interval=1,
-        keep_period=1,
-        log_interval=1,
-        wandb_enabled=False,
-        fsdp_devices=1,
-        val_num_batches=1,
-    ),
-
-        TrainConfig(
-        name="pi_behavior_b1k_5070_smoke",
-        exp_name="5070_smoke",
-        project_name="B1K",
-        model=pi_behavior_config.PiBehaviorConfig(
-            action_horizon=30,
-            action_dim=32,
-            use_correlated_noise=False,
-            correlation_beta=0.0,
-            use_fast_auxiliary=False,
-            fast_loss_weight=0.0,
-            use_kv_transform=False,
-            use_knowledge_insulation=False,
-            subtask_loss_weight=0.0,
-            freeze_vision_backbone=True,
-        ),
-        data=LeRobotB1KDataConfig(
-            repo_id="IliaLarchenko/behavior_224_rgb",
-            base_config=DataConfig(
-                prompt_from_task=False,
-                behavior_dataset_root="~/data/behavior_224_rgb",
-                use_per_timestamp_norm=False,
-            ),
-            use_delta_joint_actions=False,
-            use_fast_tokenization=False,
-        ),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=20,
-            peak_lr=1e-4,
-            decay_steps=200,
-            decay_lr=1e-5,
-        ),
-        num_flow_samples=1,
-        weight_loader=weight_loaders.PiBehaviorWeightLoader(
-            "gs://openpi-assets/checkpoints/pi05_base/params"
-        ),
-        num_train_steps=200,
-        log_interval=10,
-        save_interval=100,
-        keep_period=200,
-        assets_base_dir="./outputs/assets",
-        checkpoint_base_dir="./outputs/checkpoints",
-        num_workers=2,
-        batch_size=1,
-        wandb_enabled=False,
-        fsdp_devices=1,
-        val_num_batches=1,
-    ),
-
-    TrainConfig(
         name="pi_behavior_b1k_5070_debug",
         exp_name="5070_debug",
         project_name="B1K",
@@ -981,8 +885,8 @@ _CONFIGS = [
     TrainConfig(
         # full-size smoke가 너무 무거워서,
         # Gemma 300m / 300m 조합으로 줄인 tiny version
-        name="pi_behavior_b1k_5070_fake_smoke",
-        exp_name="5070_fake_smoke",
+        name="pi_behavior_b1k_5070_fake_tiny",
+        exp_name="5070_fake_tiny",
         project_name="B1K",
         model=pi_behavior_config.PiBehaviorConfig(
             # 핵심: paligemma / action expert 둘 다 300m로 축소

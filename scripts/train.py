@@ -228,7 +228,9 @@ def init_train_state(
             # 이미 correlation 정보가 반영된 형태로 정리된다.
             #
             # 나중에 넣으면 model state와 graphdef 타이밍이 어긋나 복잡해질 수 있다.
-            model.load_correlation_matrix(norm_stats)
+            if norm_stats is not None:
+                model.load_correlation_matrix(norm_stats)
+                logging.info("Reloaded correlation matrix after checkpoint restore")
             logging.info("Loaded correlation matrix during model initialization")
 
         # Merge the partial params into the model.
@@ -438,20 +440,7 @@ def main(config: _config.TrainConfig):
 
     # 프로그램 시작 직후 GPU 사용량
     log_gpu_mem("start")
-
-    checkpoint_manager, resuming = _checkpoints.initialize_checkpoint_dir(
-    config.checkpoint_dir,
-    keep_period=config.keep_period,
-    overwrite=config.overwrite,
-    resume=config.resume,
-    )
-    init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
-
-    # checkpoint manager / wandb 초기화 후 메모리 상태
-    log_gpu_mem("after checkpoint/wandb init")
     ######################################################
-
-    logging.info(f"Running on: {platform.node()}")
 
     if config.batch_size % jax.device_count() != 0:
         raise ValueError(
@@ -481,18 +470,10 @@ def main(config: _config.TrainConfig):
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
-    data_loader = _data_loader.create_behavior_data_loader(
-        config,
-        sharding=data_sharding,
-        shuffle=True,
-    )
-
-    data_iter = iter(data_loader)
     # 첫 batch를 학습 전에 한 번 바로 뽑아 보는 이유는
     # data loader / transform / sharding 문제가 있으면 여기서 빨리 터뜨리기 위해서다.
     # 즉, 긴 초기화가 끝난 뒤 첫 step에서 죽는 것보다
     # 입력 파이프라인 문제를 가능한 앞단에서 확인하려는 sanity check다.
-    batch = next(data_iter)
 
     # 4/8 추가 ############
     # 데이터 로더 생성 자체가 메모리를 얼마나 쓰는지 확인
@@ -511,11 +492,9 @@ def main(config: _config.TrainConfig):
     # 첫 batch를 실제로 뽑아보는 순간
     # 여기서 죽으면 dataset / transform / batching 단계 문제일 가능성이 크다.
     batch = next(data_iter)
-    logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     log_gpu_mem("after first batch")
     #######################################
-    logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     # Log images from first batch to sanity check.
     if config.wandb_enabled:
@@ -548,22 +527,11 @@ def main(config: _config.TrainConfig):
             )
     norm_stats = data_config.norm_stats
 
-    # 4/8 추가 #########
-    # model init / weight restore / optimizer state 생성 직전 메모리 확인
-    log_gpu_mem("before init_train_state")
-
-    train_state, train_state_sharding = init_train_state(
-        config, init_rng, mesh, resume=resuming, norm_stats=norm_stats
-    )
-
     # 4/8 추가 #############
     # 기존 jax.block_until_ready(train_state) 대신 사용
     # JAX 계산이 실제 끝난 뒤 메모리를 확인하기 위해 block_and_log 사용
-    block_and_log("after init_train_state", train_state)
-
     # model init / optimizer state / pretrained restore 직전
     log_gpu_mem("before init_train_state")
-
     train_state, train_state_sharding = init_train_state(
         config, init_rng, mesh, resume=resuming, norm_stats=norm_stats
     )
@@ -573,9 +541,6 @@ def main(config: _config.TrainConfig):
 
     logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
     ################################
-
-    jax.block_until_ready(train_state)
-    logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
 
     # 저장은 save_interval마다 하되,
     # 시작 step 바로 직후의 중복 저장은 피하고,
